@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import json
 import re
 from pathlib import Path
@@ -31,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--input-jsonl", required=True)
     parser.add_argument("--output-jsonl", required=True)
+    parser.add_argument("--valid-output-jsonl")
+    parser.add_argument("--failure-csv")
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--max-new-tokens", type=int, default=4)
     return parser.parse_args()
@@ -200,7 +203,7 @@ def generate_with_trace(
     system_prompt: str,
     max_new_tokens: int,
     forced_answer: str | None = None,
-) -> tuple[str, dict, list[dict], dict]:
+) -> tuple[str, str, dict, list[dict], dict]:
     messages = build_messages(image_path, question, system_prompt)
     device = model.device
     model_inputs, cpu_inputs = prepare_inputs(processor, messages, device)
@@ -276,7 +279,7 @@ def generate_with_trace(
         "vision_token_span": attention_metadata["vision_token_span"],
         "merged_grid_thw": attention_metadata["merged_grid_thw"],
     }
-    return normalize_binary_answer(decoded), question_attention, trace, metadata
+    return normalize_binary_answer(decoded), decoded.strip(), question_attention, trace, metadata
 
 
 def validate_image_paths(records: list[dict]) -> None:
@@ -289,7 +292,15 @@ def main() -> int:
     args = parse_args()
     input_path = Path(args.input_jsonl).expanduser().resolve()
     output_path = Path(args.output_jsonl).expanduser().resolve()
+    valid_output_path = (
+        Path(args.valid_output_jsonl).expanduser().resolve() if args.valid_output_jsonl else None
+    )
+    failure_csv_path = Path(args.failure_csv).expanduser().resolve() if args.failure_csv else None
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if valid_output_path is not None:
+        valid_output_path.parent.mkdir(parents=True, exist_ok=True)
+    if failure_csv_path is not None:
+        failure_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     records = load_records(input_path, args.limit)
     if not records:
@@ -304,50 +315,119 @@ def main() -> int:
         attn_implementation="eager",
     )
 
-    with output_path.open("w", encoding="utf-8") as handle:
-        for index, record in enumerate(records, start=1):
-            question = record["question"]
-            image_path = record["image_path"]
-            factual_answer, factual_question_attention, factual_trace, factual_meta = generate_with_trace(
-                model=model,
-                processor=processor,
-                image_path=image_path,
-                question=question,
-                system_prompt=FACTUAL_SYSTEM_PROMPT,
-                max_new_tokens=args.max_new_tokens,
+    failures: list[dict] = []
+    valid_count = 0
+    with output_path.open("w", encoding="utf-8") as all_handle:
+        valid_handle = (
+            valid_output_path.open("w", encoding="utf-8") if valid_output_path is not None else None
+        )
+        try:
+            for index, record in enumerate(records, start=1):
+                question = record["question"]
+                image_path = record["image_path"]
+                sample_id = record.get("sample_id", Path(image_path).stem)
+                expected_answer = normalize_binary_answer(record.get("expected_answer", "yes"))
+                hallucination_target = normalize_binary_answer(
+                    record.get("hallucinated_answer_target", opposite_binary_answer(expected_answer))
+                )
+                factual_answer, factual_raw_text, factual_question_attention, factual_trace, factual_meta = generate_with_trace(
+                    model=model,
+                    processor=processor,
+                    image_path=image_path,
+                    question=question,
+                    system_prompt=FACTUAL_SYSTEM_PROMPT,
+                    max_new_tokens=args.max_new_tokens,
+                )
+                hallucinated_answer, hallucinated_raw_text, hallucinated_question_attention, hallucinated_trace, hallucinated_meta = generate_with_trace(
+                    model=model,
+                    processor=processor,
+                    image_path=image_path,
+                    question=question,
+                    system_prompt=HALLUCINATION_SYSTEM_PROMPT_TEMPLATE.format(
+                        target_answer=hallucination_target
+                    ),
+                    max_new_tokens=args.max_new_tokens,
+                    forced_answer=hallucination_target,
+                )
+                factual_correct = factual_answer == expected_answer
+                hallucinated_matches_target = hallucinated_answer == hallucination_target
+                is_valid_contrastive = (
+                    factual_correct
+                    and hallucinated_matches_target
+                    and expected_answer != hallucination_target
+                )
+                output_record = {
+                    "sample_id": sample_id,
+                    "image_path": image_path,
+                    "class_id": record["class_id"],
+                    "object_label": record["object_label"],
+                    "question": question,
+                    "expected_answer": expected_answer,
+                    "hallucination_target": hallucination_target,
+                    "factual_answer": factual_answer,
+                    "factual_raw_text": factual_raw_text,
+                    "hallucinated_answer": hallucinated_answer,
+                    "hallucinated_raw_text": hallucinated_raw_text,
+                    "factual_correct": factual_correct,
+                    "hallucinated_matches_target": hallucinated_matches_target,
+                    "is_valid_contrastive": is_valid_contrastive,
+                    "factual_question_attention": factual_question_attention,
+                    "hallucinated_question_attention": hallucinated_question_attention,
+                    "factual_trace": factual_trace,
+                    "hallucinated_trace": hallucinated_trace,
+                    "factual_meta": factual_meta,
+                    "hallucinated_meta": hallucinated_meta,
+                }
+                all_handle.write(json.dumps(output_record, ensure_ascii=False) + "\n")
+                all_handle.flush()
+                if is_valid_contrastive and valid_handle is not None:
+                    valid_handle.write(json.dumps(output_record, ensure_ascii=False) + "\n")
+                    valid_handle.flush()
+                    valid_count += 1
+                elif not is_valid_contrastive:
+                    failures.append(
+                        {
+                            "sample_id": sample_id,
+                            "object_label": record["object_label"],
+                            "expected_answer": expected_answer,
+                            "factual_answer": factual_answer,
+                            "hallucinated_answer": hallucinated_answer,
+                            "hallucination_target": hallucination_target,
+                            "reason": (
+                                "factual_incorrect"
+                                if not factual_correct
+                                else "hallucinated_target_mismatch"
+                            ),
+                        }
+                    )
+                print(
+                    f"[{index}/{len(records)}] {sample_id} expected={expected_answer} "
+                    f"factual={factual_answer} hallucinated={hallucinated_answer} valid={is_valid_contrastive}"
+                )
+        finally:
+            if valid_handle is not None:
+                valid_handle.close()
+
+    if failure_csv_path is not None:
+        with failure_csv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "sample_id",
+                    "object_label",
+                    "expected_answer",
+                    "factual_answer",
+                    "hallucinated_answer",
+                    "hallucination_target",
+                    "reason",
+                ],
             )
-            hallucination_target = opposite_binary_answer(factual_answer)
-            hallucinated_answer, hallucinated_question_attention, hallucinated_trace, hallucinated_meta = generate_with_trace(
-                model=model,
-                processor=processor,
-                image_path=image_path,
-                question=question,
-                system_prompt=HALLUCINATION_SYSTEM_PROMPT_TEMPLATE.format(
-                    target_answer=hallucination_target
-                ),
-                max_new_tokens=args.max_new_tokens,
-                forced_answer=hallucination_target,
-            )
-            output_record = {
-                "image_path": image_path,
-                "class_id": record["class_id"],
-                "object_label": record["object_label"],
-                "question": question,
-                "factual_answer": factual_answer,
-                "hallucinated_answer": hallucinated_answer,
-                "hallucination_target": hallucination_target,
-                "factual_question_attention": factual_question_attention,
-                "hallucinated_question_attention": hallucinated_question_attention,
-                "factual_trace": factual_trace,
-                "hallucinated_trace": hallucinated_trace,
-                "factual_meta": factual_meta,
-                "hallucinated_meta": hallucinated_meta,
-            }
-            handle.write(json.dumps(output_record, ensure_ascii=False) + "\n")
-            handle.flush()
-            print(
-                f"[{index}/{len(records)}] {Path(image_path).name} factual={factual_answer} hallucinated={hallucinated_answer}"
-            )
+            writer.writeheader()
+            for row in failures:
+                writer.writerow(row)
+
+    if valid_output_path is not None:
+        print(f"Valid contrastive records: {valid_count}/{len(records)}")
 
     return 0
 

@@ -1,255 +1,161 @@
 #!/usr/bin/env python3
 import argparse
 import csv
-import itertools
 import json
-import math
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image, ImageDraw
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+
+from attention_binary_utils import build_token_samples, load_records, resize_stack
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze whether factual and hallucinated answer tokens are separable."
+        description="Train high-dimensional factual-vs-hallucinated token classifiers."
     )
     parser.add_argument("--input-jsonl", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--topk-fraction", type=float, default=0.1)
-    parser.add_argument("--scatter-size", type=int, default=800)
+    parser.add_argument("--cv-splits", type=int, default=5)
+    parser.add_argument("--test-fraction", type=float, default=0.2)
+    parser.add_argument("--random-seed", type=int, default=7)
+    parser.add_argument("--hard-case-limit", type=int, default=30)
     return parser.parse_args()
 
 
-def load_records(path: Path) -> list[dict]:
-    records = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    return records
+def scalar_feature_names() -> list[str]:
+    return [
+        "question_alignment",
+        "question_center_shift",
+        "answer_entropy",
+        "answer_topk_mass",
+        "answer_peak_value",
+        "answer_mean_value",
+        "pair_js_divergence",
+        "pair_cosine_similarity",
+        "pair_center_shift",
+        "cot_alignment_gain",
+    ]
 
 
-def answer_block(trace: list[dict]) -> dict:
-    if not trace:
-        raise ValueError("Expected answer token trace.")
-    return trace[0]["cross_attention"]
+def metrics_from_predictions(y_true: np.ndarray, y_pred: np.ndarray, scores: np.ndarray | None) -> dict[str, float]:
+    metrics = {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+    }
+    if scores is not None and len(np.unique(y_true)) > 1:
+        metrics["roc_auc"] = float(roc_auc_score(y_true, scores))
+    else:
+        metrics["roc_auc"] = None
+    return metrics
 
 
-def block_mean_map(block: dict) -> np.ndarray:
-    return np.array(block["layer_summary"]["mean_over_layers"], dtype=np.float64)
-
-
-def entropy_score(heatmap: np.ndarray) -> float:
-    values = np.clip(heatmap.reshape(-1), 0.0, None)
-    total = values.sum()
-    if total <= 0:
-        return 0.0
-    probs = values / total
-    probs = probs[probs > 0]
-    return float(-(probs * np.log(probs)).sum())
-
-
-def topk_mass(heatmap: np.ndarray, fraction: float) -> float:
-    values = np.clip(heatmap.reshape(-1), 0.0, None)
-    total = values.sum()
-    if total <= 0:
-        return 0.0
-    count = max(1, int(math.ceil(values.size * fraction)))
-    top_values = np.partition(values, -count)[-count:]
-    return float(top_values.sum() / total)
-
-
-def cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
-    left_flat = left.reshape(-1)
-    right_flat = right.reshape(-1)
-    denom = np.linalg.norm(left_flat) * np.linalg.norm(right_flat)
-    if denom == 0:
-        return 0.0
-    return float(np.dot(left_flat, right_flat) / denom)
-
-
-def js_divergence(left: np.ndarray, right: np.ndarray) -> float:
-    left_flat = np.clip(left.reshape(-1), 0.0, None)
-    right_flat = np.clip(right.reshape(-1), 0.0, None)
-    if left_flat.sum() <= 0 or right_flat.sum() <= 0:
-        return 0.0
-    left_probs = left_flat / left_flat.sum()
-    right_probs = right_flat / right_flat.sum()
-    mean = 0.5 * (left_probs + right_probs)
-
-    def kl_div(a: np.ndarray, b: np.ndarray) -> float:
-        mask = a > 0
-        return float(np.sum(a[mask] * np.log(a[mask] / b[mask])))
-
-    return 0.5 * kl_div(left_probs, mean) + 0.5 * kl_div(right_probs, mean)
-
-
-def center_of_mass(heatmap: np.ndarray) -> tuple[float, float]:
-    values = np.clip(heatmap, 0.0, None)
-    total = values.sum()
-    if total <= 0:
-        return 0.0, 0.0
-    ys, xs = np.indices(values.shape)
-    y = float((ys * values).sum() / total)
-    x = float((xs * values).sum() / total)
-    return y, x
-
-
-def distance_between_maps(left: np.ndarray, right: np.ndarray) -> float:
-    return float(math.dist(center_of_mass(left), center_of_mass(right)))
-
-
-def build_token_samples(records: list[dict], topk_fraction: float) -> list[dict]:
-    samples: list[dict] = []
-    for index, record in enumerate(records):
-        fq = block_mean_map(record["factual_question_attention"])
-        hq = block_mean_map(record["hallucinated_question_attention"])
-        fa = block_mean_map(answer_block(record["factual_trace"]))
-        ha = block_mean_map(answer_block(record["hallucinated_trace"]))
-
-        common = {
-            "record_index": index,
-            "image_path": record["image_path"],
-            "object_label": record["object_label"],
-            "factual_answer": record["factual_answer"],
-            "hallucinated_answer": record["hallucinated_answer"],
-            "pair_js_divergence": js_divergence(fa, ha),
-            "pair_cosine_similarity": cosine_similarity(fa, ha),
-            "pair_center_shift": distance_between_maps(fa, ha),
-        }
-        samples.append(
-            {
-                **common,
-                "label": 0,
-                "label_name": "factual",
-                "question_alignment": cosine_similarity(fq, fa),
-                "question_center_shift": distance_between_maps(fq, fa),
-                "answer_entropy": entropy_score(fa),
-                "answer_topk_mass": topk_mass(fa, topk_fraction),
-                "answer_peak_value": float(np.max(fa)),
-                "answer_mean_value": float(np.mean(fa)),
-            }
-        )
-        samples.append(
-            {
-                **common,
-                "label": 1,
-                "label_name": "hallucinated",
-                "question_alignment": cosine_similarity(hq, ha),
-                "question_center_shift": distance_between_maps(hq, ha),
-                "answer_entropy": entropy_score(ha),
-                "answer_topk_mass": topk_mass(ha, topk_fraction),
-                "answer_peak_value": float(np.max(ha)),
-                "answer_mean_value": float(np.mean(ha)),
-            }
-        )
-    return samples
-
-
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    y_true = y_true.astype(int)
-    y_pred = y_pred.astype(int)
-    tp = int(np.sum((y_true == 1) & (y_pred == 1)))
-    tn = int(np.sum((y_true == 0) & (y_pred == 0)))
-    fp = int(np.sum((y_true == 0) & (y_pred == 1)))
-    fn = int(np.sum((y_true == 1) & (y_pred == 0)))
-    pos_total = max(1, tp + fn)
-    neg_total = max(1, tn + fp)
-    precision = tp / max(1, tp + fp)
-    recall = tp / pos_total
-    specificity = tn / neg_total
-    accuracy = (tp + tn) / len(y_true)
-    balanced_accuracy = 0.5 * (recall + specificity)
+def make_models(random_seed: int) -> dict[str, Pipeline]:
     return {
-        "tp": tp,
-        "tn": tn,
-        "fp": fp,
-        "fn": fn,
-        "accuracy": accuracy,
-        "balanced_accuracy": balanced_accuracy,
-        "precision": precision,
-        "recall": recall,
-        "specificity": specificity,
+        "scalar_logistic": Pipeline(
+            [
+                ("scale", StandardScaler()),
+                ("clf", LogisticRegression(max_iter=5000, random_state=random_seed)),
+            ]
+        ),
+        "highdim_logistic": Pipeline(
+            [
+                ("scale", StandardScaler()),
+                ("clf", LogisticRegression(max_iter=5000, random_state=random_seed)),
+            ]
+        ),
+        "highdim_rbf_svm": Pipeline(
+            [
+                ("scale", StandardScaler()),
+                ("clf", SVC(kernel="rbf", C=1.0, gamma="scale")),
+            ]
+        ),
     }
 
 
-def threshold_scan(samples: list[dict], feature_names: list[str]) -> tuple[list[dict], list[dict]]:
-    y_true = np.array([sample["label"] for sample in samples], dtype=int)
-    all_rows: list[dict] = []
-    best_rows: list[dict] = []
-    for feature_name in feature_names:
-        values = np.array([sample[feature_name] for sample in samples], dtype=float)
-        thresholds = sorted(set(values.tolist()))
-        best_row = None
-        for threshold in thresholds:
-            for direction in (">=", "<="):
-                if direction == ">=":
-                    y_pred = (values >= threshold).astype(int)
-                else:
-                    y_pred = (values <= threshold).astype(int)
-                metrics = compute_metrics(y_true, y_pred)
-                row = {
-                    "feature": feature_name,
-                    "threshold": threshold,
-                    "direction": direction,
-                    **metrics,
-                }
-                all_rows.append(row)
-                if best_row is None or row["balanced_accuracy"] > best_row["balanced_accuracy"]:
-                    best_row = row
-        best_rows.append(best_row)
-    best_rows.sort(key=lambda row: row["balanced_accuracy"], reverse=True)
-    return all_rows, best_rows
+def cross_validate_model(
+    *,
+    model: Pipeline,
+    model_name: str,
+    x: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    cv_splits: int,
+) -> dict:
+    splitter = GroupKFold(n_splits=min(cv_splits, len(np.unique(groups))))
+    fold_rows = []
+    for fold_index, (train_idx, test_idx) in enumerate(splitter.split(x, y, groups), start=1):
+        model.fit(x[train_idx], y[train_idx])
+        y_pred = model.predict(x[test_idx])
+        if hasattr(model, "decision_function"):
+            scores = model.decision_function(x[test_idx])
+        else:
+            scores = None
+        row = {"fold": fold_index}
+        row.update(metrics_from_predictions(y[test_idx], y_pred, scores))
+        fold_rows.append(row)
+    summary = {
+        "model_name": model_name,
+        "folds": fold_rows,
+        "mean_metrics": {
+            key: float(np.mean([row[key] for row in fold_rows if row[key] is not None]))
+            for key in fold_rows[0]
+            if key != "fold"
+        },
+    }
+    return summary
 
 
-def fit_linear_separator(
-    samples: list[dict], feature_subset: list[str]
-) -> dict[str, object]:
-    x = np.array([[sample[name] for name in feature_subset] for sample in samples], dtype=float)
-    y = np.array([sample["label"] for sample in samples], dtype=int)
-    means = x.mean(axis=0)
-    stds = x.std(axis=0)
-    stds[stds == 0] = 1.0
-    x_scaled = (x - means) / stds
-
-    x0 = x_scaled[y == 0]
-    x1 = x_scaled[y == 1]
-    mu0 = x0.mean(axis=0)
-    mu1 = x1.mean(axis=0)
-    centered0 = x0 - mu0
-    centered1 = x1 - mu1
-    covariance = (
-        centered0.T @ centered0 + centered1.T @ centered1
-    ) / max(1, len(x_scaled) - 2)
-    covariance += np.eye(covariance.shape[0]) * 1e-4
-    weights = np.linalg.solve(covariance, mu1 - mu0)
-    intercept = -0.5 * float((mu0 + mu1) @ weights)
-
-    scores = x_scaled @ weights + intercept
-    y_pred = (scores >= 0).astype(int)
-    metrics = compute_metrics(y, y_pred)
+def holdout_evaluation(
+    *,
+    model: Pipeline,
+    x: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    test_fraction: float,
+    random_seed: int,
+) -> dict:
+    splitter = GroupShuffleSplit(n_splits=1, test_size=test_fraction, random_state=random_seed)
+    train_idx, test_idx = next(splitter.split(x, y, groups))
+    model.fit(x[train_idx], y[train_idx])
+    y_pred = model.predict(x[test_idx])
+    if hasattr(model, "decision_function"):
+        scores = model.decision_function(x[test_idx])
+    else:
+        scores = None
     return {
-        "feature_subset": feature_subset,
-        "means": means.tolist(),
-        "stds": stds.tolist(),
-        "weights": weights.tolist(),
-        "intercept": intercept,
-        "metrics": metrics,
-        "scores": scores.tolist(),
-        "predictions": y_pred.tolist(),
+        "train_indices": train_idx.tolist(),
+        "test_indices": test_idx.tolist(),
+        "y_true": y[test_idx].tolist(),
+        "y_pred": y_pred.tolist(),
+        "scores": scores.tolist() if scores is not None else None,
+        "metrics": metrics_from_predictions(y[test_idx], y_pred, scores),
+        "confusion_matrix": confusion_matrix(y[test_idx], y_pred).tolist(),
     }
 
 
-def search_linear_separators(samples: list[dict], feature_names: list[str]) -> list[dict]:
-    results: list[dict] = []
-    for subset_size in (2, 3, 4):
-        for subset in itertools.combinations(feature_names, subset_size):
-            result = fit_linear_separator(samples, list(subset))
-            results.append(result)
-    results.sort(key=lambda item: item["metrics"]["balanced_accuracy"], reverse=True)
-    return results
+def save_json(path: Path, payload: dict) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
 
 
 def save_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
@@ -260,50 +166,95 @@ def save_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
             writer.writerow(row)
 
 
-def normalize(values: np.ndarray) -> np.ndarray:
-    minimum = float(values.min())
-    maximum = float(values.max())
-    if math.isclose(minimum, maximum):
-        return np.zeros_like(values)
-    return (values - minimum) / (maximum - minimum)
+def save_confusion_matrix(confusion: list[list[int]], output_path: Path, title: str) -> None:
+    matrix = np.array(confusion, dtype=int)
+    fig, ax = plt.subplots(figsize=(5, 4.5))
+    im = ax.imshow(matrix, cmap="Blues")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xticks([0, 1], labels=["Factual", "Hallucinated"])
+    ax.set_yticks([0, 1], labels=["Factual", "Hallucinated"])
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(title)
+    for row in range(matrix.shape[0]):
+        for col in range(matrix.shape[1]):
+            ax.text(col, row, str(matrix[row, col]), ha="center", va="center", color="black")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
 
-def draw_scatter(
-    samples: list[dict],
-    x_feature: str,
-    y_feature: str,
+def save_score_distribution(scores: np.ndarray, y_true: np.ndarray, output_path: Path, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.hist(scores[y_true == 0], bins=20, alpha=0.75, label="Factual", color="tab:blue")
+    ax.hist(scores[y_true == 1], bins=20, alpha=0.75, label="Hallucinated", color="tab:red")
+    ax.set_xlabel("Decision score")
+    ax.set_ylabel("Count")
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_layer_importance(
+    *,
+    model: Pipeline,
+    feature_shape: tuple[int, int, int],
     output_path: Path,
-    size: int,
-) -> None:
-    image = Image.new("RGB", (size, size), "white")
-    draw = ImageDraw.Draw(image)
-    margin = 70
-    plot_left, plot_top = margin, margin
-    plot_right, plot_bottom = size - margin, size - margin
-    draw.rectangle([plot_left, plot_top, plot_right, plot_bottom], outline="black")
-    draw.text((plot_left, 18), f"{x_feature} vs {y_feature}", fill="black")
-    draw.text((plot_left, size - 40), x_feature, fill="black")
-    draw.text((10, plot_top), y_feature, fill="black")
-
-    x_values = np.array([sample[x_feature] for sample in samples], dtype=float)
-    y_values = np.array([sample[y_feature] for sample in samples], dtype=float)
-    x_norm = normalize(x_values)
-    y_norm = normalize(y_values)
-
-    for sample, x_value, y_value in zip(samples, x_norm, y_norm):
-        x = plot_left + int((plot_right - plot_left) * x_value)
-        y = plot_bottom - int((plot_bottom - plot_top) * y_value)
-        color = (50, 110, 220) if sample["label"] == 0 else (220, 70, 70)
-        draw.ellipse([x - 4, y - 4, x + 4, y + 4], fill=color)
-
-    draw.text((plot_right - 180, plot_top + 10), "Blue: factual", fill=(50, 110, 220))
-    draw.text((plot_right - 180, plot_top + 28), "Red: hallucinated", fill=(220, 70, 70))
-    image.save(output_path)
+) -> list[dict]:
+    classifier = model.named_steps["clf"]
+    weights = classifier.coef_[0]
+    layer_count, height, width = feature_shape
+    reshaped = np.abs(weights).reshape(layer_count, height * width)
+    rows = []
+    for layer_idx, layer_weights in enumerate(reshaped):
+        rows.append(
+            {
+                "layer_index": layer_idx,
+                "mean_abs_weight": float(np.mean(layer_weights)),
+                "max_abs_weight": float(np.max(layer_weights)),
+                "sum_abs_weight": float(np.sum(layer_weights)),
+            }
+        )
+    rows.sort(key=lambda item: item["sum_abs_weight"], reverse=True)
+    save_csv(
+        output_path,
+        rows,
+        ["layer_index", "mean_abs_weight", "max_abs_weight", "sum_abs_weight"],
+    )
+    return rows
 
 
-def save_report_json(path: Path, payload: dict) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, ensure_ascii=False)
+def build_hard_cases(
+    token_samples: list[dict],
+    holdout_result: dict,
+    hard_case_limit: int,
+) -> list[dict]:
+    if holdout_result["scores"] is None:
+        return []
+    rows = []
+    for local_index, sample_index in enumerate(holdout_result["test_indices"]):
+        sample = token_samples[sample_index]
+        score = float(holdout_result["scores"][local_index])
+        prediction = int(holdout_result["y_pred"][local_index])
+        rows.append(
+            {
+                "sample_id": sample["sample_id"],
+                "object_label": sample["object_label"],
+                "label_name": sample["label_name"],
+                "expected_answer": sample["expected_answer"],
+                "factual_answer": sample["factual_answer"],
+                "hallucinated_answer": sample["hallucinated_answer"],
+                "score": score,
+                "prediction": prediction,
+                "correct": int(prediction == sample["label"]),
+                "abs_margin": abs(score),
+            }
+        )
+    rows.sort(key=lambda item: (item["correct"], item["abs_margin"]))
+    return rows[:hard_case_limit]
 
 
 def main() -> int:
@@ -313,91 +264,111 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     records = load_records(input_path)
-    samples = build_token_samples(records, topk_fraction=args.topk_fraction)
-    feature_names = [
-        "question_alignment",
-        "question_center_shift",
-        "answer_entropy",
-        "answer_topk_mass",
-        "answer_peak_value",
-        "answer_mean_value",
-        "pair_js_divergence",
-        "pair_cosine_similarity",
-        "pair_center_shift",
-    ]
+    token_samples = build_token_samples(records, topk_fraction=args.topk_fraction)
+    y = np.array([sample["label"] for sample in token_samples], dtype=int)
+    groups = np.array([sample["sample_id"] for sample in token_samples])
+    x_scalar = np.array(
+        [[sample[name] for name in scalar_feature_names()] for sample in token_samples],
+        dtype=np.float64,
+    )
+    target_hw = (
+        max(sample["attention_stack"].shape[1] for sample in token_samples),
+        max(sample["attention_stack"].shape[2] for sample in token_samples),
+    )
+    resized_stacks = [resize_stack(sample["attention_stack"], target_hw) for sample in token_samples]
+    x_highdim = np.stack([stack.reshape(-1) for stack in resized_stacks], axis=0)
+    feature_shape = resized_stacks[0].shape
 
-    threshold_rows, best_thresholds = threshold_scan(samples, feature_names)
-    save_csv(
-        output_dir / "threshold_scan.csv",
-        threshold_rows,
-        [
-            "feature",
-            "threshold",
-            "direction",
-            "tp",
-            "tn",
-            "fp",
-            "fn",
-            "accuracy",
-            "balanced_accuracy",
-            "precision",
-            "recall",
-            "specificity",
-        ],
+    models = make_models(args.random_seed)
+    model_inputs = {
+        "scalar_logistic": x_scalar,
+        "highdim_logistic": x_highdim,
+        "highdim_rbf_svm": x_highdim,
+    }
+
+    cv_results = []
+    for model_name, model in models.items():
+        cv_results.append(
+            cross_validate_model(
+                model=model,
+                model_name=model_name,
+                x=model_inputs[model_name],
+                y=y,
+                groups=groups,
+                cv_splits=args.cv_splits,
+            )
+        )
+    cv_results.sort(key=lambda item: item["mean_metrics"]["balanced_accuracy"], reverse=True)
+    best_model_name = cv_results[0]["model_name"]
+    best_model = models[best_model_name]
+    best_input = model_inputs[best_model_name]
+    holdout_result = holdout_evaluation(
+        model=best_model,
+        x=best_input,
+        y=y,
+        groups=groups,
+        test_fraction=args.test_fraction,
+        random_seed=args.random_seed,
     )
 
-    separator_results = search_linear_separators(samples, feature_names)
-    best_separator = separator_results[0]
-    save_report_json(output_dir / "linear_separator_summary.json", best_separator)
-
-    top_scatter_features = [row["feature"] for row in best_thresholds[:4]]
-    scatter_pairs = [
-        (top_scatter_features[0], top_scatter_features[1]),
-        (top_scatter_features[0], top_scatter_features[2]),
-        (top_scatter_features[1], top_scatter_features[2]),
-    ]
-    for x_feature, y_feature in scatter_pairs:
-        filename = f"pairwise_scatter_{x_feature}_vs_{y_feature}.png"
-        draw_scatter(
-            samples=samples,
-            x_feature=x_feature,
-            y_feature=y_feature,
-            output_path=output_dir / filename,
-            size=args.scatter_size,
+    save_json(
+        output_dir / "classifier_summary.json",
+        {
+            "record_count": len(records),
+            "token_sample_count": len(token_samples),
+            "feature_shape": {
+                "layer_count": int(feature_shape[0]),
+                "height": int(feature_shape[1]),
+                "width": int(feature_shape[2]),
+            },
+            "cross_validation": cv_results,
+            "best_model_name": best_model_name,
+            "best_model_holdout": holdout_result,
+        },
+    )
+    save_confusion_matrix(
+        holdout_result["confusion_matrix"],
+        output_dir / f"{best_model_name}_confusion_matrix.png",
+        title=f"{best_model_name} holdout confusion matrix",
+    )
+    if holdout_result["scores"] is not None:
+        save_score_distribution(
+            scores=np.array(holdout_result["scores"], dtype=np.float64),
+            y_true=np.array(holdout_result["y_true"], dtype=int),
+            output_path=output_dir / f"{best_model_name}_score_distribution.png",
+            title=f"{best_model_name} holdout decision scores",
         )
 
-    threshold_conclusion = best_thresholds[0]
-    threshold_exists = threshold_conclusion["balanced_accuracy"] >= 0.75
-    linear_exists = best_separator["metrics"]["balanced_accuracy"] >= 0.8
-    if linear_exists and threshold_exists:
-        overall = "Both a useful scalar threshold and a low-dimensional linear separator are present."
-    elif linear_exists:
-        overall = "A stable low-dimensional linear separator exists, while single-metric thresholds are weaker."
-    elif threshold_exists:
-        overall = "A useful scalar threshold exists, but linear separation is not materially stronger."
-    else:
-        overall = "The classes show statistical shift but no strong standalone threshold or low-dimensional separator."
+    logistic_model = models["highdim_logistic"]
+    logistic_model.fit(x_highdim, y)
+    layer_rows = save_layer_importance(
+        model=logistic_model,
+        feature_shape=feature_shape,
+        output_path=output_dir / "highdim_logistic_layer_importance.csv",
+    )
+    save_json(
+        output_dir / "highdim_logistic_layer_importance.json",
+        {"top_layers": layer_rows[:10]},
+    )
 
-    report = {
-        "record_count": len(records),
-        "token_sample_count": len(samples),
-        "best_threshold": best_thresholds[0],
-        "top_thresholds": best_thresholds[:5],
-        "best_linear_separator": best_separator,
-        "top_linear_separators": [
-            {
-                "feature_subset": item["feature_subset"],
-                "metrics": item["metrics"],
-                "weights": item["weights"],
-                "intercept": item["intercept"],
-            }
-            for item in separator_results[:5]
-        ],
-        "conclusion": overall,
-        "threshold_like_mechanism": threshold_exists,
-        "linear_separator_like_mechanism": linear_exists,
-    }
-    save_report_json(output_dir / "token_separability_report.json", report)
+    hard_cases = build_hard_cases(token_samples, holdout_result, args.hard_case_limit)
+    if hard_cases:
+        save_csv(
+            output_dir / "hard_overlap_cases.csv",
+            hard_cases,
+            [
+                "sample_id",
+                "object_label",
+                "label_name",
+                "expected_answer",
+                "factual_answer",
+                "hallucinated_answer",
+                "score",
+                "prediction",
+                "correct",
+                "abs_margin",
+            ],
+        )
     return 0
 
 

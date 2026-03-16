@@ -2,57 +2,50 @@
 import argparse
 import csv
 import json
-import math
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+from attention_binary_utils import (
+    answer_block,
+    block_layer_stack,
+    block_mean_map,
+    build_token_samples,
+    center_shift,
+    cosine_similarity,
+    entropy_score,
+    js_divergence,
+    layer_cosine_curve,
+    layer_js_curve,
+    load_records,
+    resize_stack,
+    topk_mass,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Visualize Qwen factual vs hallucinated cross-attention maps."
+        description="Visualize binary factual-vs-hallucinated attention with PCA and layer ranking."
     )
     parser.add_argument("--input-jsonl", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--summary-size", type=int, default=224)
-    parser.add_argument("--per-sample-limit", type=int, default=100)
+    parser.add_argument("--per-sample-limit", type=int, default=32)
     parser.add_argument("--topk-fraction", type=float, default=0.1)
+    parser.add_argument("--top-layer-count", type=int, default=5)
+    parser.add_argument("--band-width", type=int, default=3)
     return parser.parse_args()
 
 
-def load_records(path: Path) -> list[dict]:
-    records = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    return records
-
-
-def sorted_layer_names(layer_maps: dict[str, list[list[float]]]) -> list[str]:
-    return sorted(layer_maps, key=lambda item: int(item.split("_")[1]))
-
-
-def block_mean_map(block: dict) -> np.ndarray:
-    return np.array(block["layer_summary"]["mean_over_layers"], dtype=np.float32)
-
-
-def block_layer_stack(block: dict) -> np.ndarray:
-    layer_maps = block["layer_maps"]
-    ordered = sorted_layer_names(layer_maps)
-    return np.stack([np.array(layer_maps[name], dtype=np.float32) for name in ordered], axis=0)
-
-
-def answer_block(trace: list[dict]) -> dict:
-    if not trace:
-        raise ValueError("Expected at least one answer token trace.")
-    return trace[0]["cross_attention"]
-
-
-def load_image(path: str) -> Image.Image:
-    return Image.open(path).convert("RGB")
+def load_image(path: str) -> np.ndarray:
+    return np.asarray(Image.open(path).convert("RGB"))
 
 
 def resize_heatmap(heatmap: np.ndarray, size: tuple[int, int]) -> np.ndarray:
@@ -64,234 +57,336 @@ def resize_heatmap(heatmap: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return np.asarray(resized, dtype=np.float32) / 255.0
 
 
-def normalize_for_display(heatmap: np.ndarray) -> np.ndarray:
-    if heatmap.size == 0:
-        return heatmap
-    min_value = float(heatmap.min())
-    max_value = float(heatmap.max())
-    if math.isclose(min_value, max_value):
-        return np.zeros_like(heatmap)
-    return (heatmap - min_value) / (max_value - min_value)
-
-
-def heatmap_to_rgb(heatmap: np.ndarray) -> np.ndarray:
-    normalized = normalize_for_display(heatmap)
-    red = np.clip(1.5 - np.abs(4 * normalized - 3), 0.0, 1.0)
-    green = np.clip(1.5 - np.abs(4 * normalized - 2), 0.0, 1.0)
-    blue = np.clip(1.5 - np.abs(4 * normalized - 1), 0.0, 1.0)
-    return (np.stack([red, green, blue], axis=-1) * 255).astype(np.uint8)
-
-
-def overlay_image(base_image: Image.Image, heatmap: np.ndarray, alpha: float = 0.45) -> Image.Image:
-    resized_heatmap = resize_heatmap(heatmap, base_image.size)
-    overlay = Image.fromarray(heatmap_to_rgb(resized_heatmap))
-    return Image.blend(base_image, overlay, alpha=alpha)
-
-
-def labeled_panel(image: Image.Image, title: str) -> Image.Image:
-    panel = Image.new("RGB", (image.width, image.height + 28), "white")
-    panel.paste(image, (0, 28))
-    draw = ImageDraw.Draw(panel)
-    draw.text((8, 8), title, fill="black")
-    return panel
-
-
-def compose_horizontal(panels: list[Image.Image]) -> Image.Image:
-    width = sum(panel.width for panel in panels)
-    height = max(panel.height for panel in panels)
-    canvas = Image.new("RGB", (width, height), "white")
-    x_offset = 0
-    for panel in panels:
-        canvas.paste(panel, (x_offset, 0))
-        x_offset += panel.width
-    return canvas
-
-
-def entropy_score(heatmap: np.ndarray) -> float:
-    values = np.clip(heatmap.astype(np.float64), 0.0, None).reshape(-1)
-    total = values.sum()
-    if total <= 0:
-        return 0.0
-    probs = values / total
-    probs = probs[probs > 0]
-    return float(-(probs * np.log(probs)).sum())
-
-
-def topk_mass(heatmap: np.ndarray, fraction: float) -> float:
-    values = np.clip(heatmap.astype(np.float64), 0.0, None).reshape(-1)
-    total = values.sum()
-    if total <= 0:
-        return 0.0
-    count = max(1, int(math.ceil(values.size * fraction)))
-    top_values = np.partition(values, -count)[-count:]
-    return float(top_values.sum() / total)
-
-
-def cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
-    left_flat = left.reshape(-1).astype(np.float64)
-    right_flat = right.reshape(-1).astype(np.float64)
-    denom = np.linalg.norm(left_flat) * np.linalg.norm(right_flat)
-    if denom == 0:
-        return 0.0
-    return float(np.dot(left_flat, right_flat) / denom)
-
-
-def js_divergence(left: np.ndarray, right: np.ndarray) -> float:
-    left_flat = np.clip(left.astype(np.float64), 0.0, None).reshape(-1)
-    right_flat = np.clip(right.astype(np.float64), 0.0, None).reshape(-1)
-    if left_flat.sum() <= 0 or right_flat.sum() <= 0:
-        return 0.0
-    left_probs = left_flat / left_flat.sum()
-    right_probs = right_flat / right_flat.sum()
-    mean = 0.5 * (left_probs + right_probs)
-
-    def kl_div(a: np.ndarray, b: np.ndarray) -> float:
-        mask = a > 0
-        return float(np.sum(a[mask] * np.log(a[mask] / b[mask])))
-
-    return 0.5 * kl_div(left_probs, mean) + 0.5 * kl_div(right_probs, mean)
-
-
-def center_of_mass(heatmap: np.ndarray) -> tuple[float, float]:
-    values = np.clip(heatmap.astype(np.float64), 0.0, None)
-    total = values.sum()
-    if total <= 0:
-        return 0.0, 0.0
-    ys, xs = np.indices(values.shape)
-    y = float((ys * values).sum() / total)
-    x = float((xs * values).sum() / total)
-    return y, x
-
-
-def center_shift(left: np.ndarray, right: np.ndarray) -> float:
-    return float(math.dist(center_of_mass(left), center_of_mass(right)))
-
-
-def draw_line_plot(
-    curves: list[tuple[np.ndarray, str, tuple[int, int, int]]],
-    title: str,
-    y_label: str,
-    output_path: Path,
-) -> None:
-    width, height = 900, 420
-    margin_left, margin_bottom, margin_top, margin_right = 70, 50, 40, 20
-    image = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(image)
-    draw.text((10, 10), title, fill="black")
-    plot_left = margin_left
-    plot_top = margin_top
-    plot_right = width - margin_right
-    plot_bottom = height - margin_bottom
-    draw.rectangle([plot_left, plot_top, plot_right, plot_bottom], outline="black")
-
-    all_values = np.concatenate([curve for curve, _, _ in curves]) if curves else np.array([0.0, 1.0])
-    y_min = float(all_values.min())
-    y_max = float(all_values.max())
-    if math.isclose(y_min, y_max):
-        y_max = y_min + 1.0
-    x_max = max(len(curve) - 1 for curve, _, _ in curves)
-    x_max = max(1, x_max)
-    draw.text((5, height // 2), y_label, fill="black")
-
-    for curve_index, (curve, label, color) in enumerate(curves):
-        points = []
-        for index, value in enumerate(curve):
-            x = plot_left + (plot_right - plot_left) * (index / x_max)
-            y = plot_bottom - (plot_bottom - plot_top) * ((value - y_min) / (y_max - y_min))
-            points.append((x, y))
-        if len(points) >= 2:
-            draw.line(points, fill=color, width=3)
-        draw.text((plot_right - 180, plot_top + 18 * curve_index), label, fill=color)
-
-    image.save(output_path)
-
-
-def draw_histogram_panel(draw, box, values: list[float], title: str) -> None:
-    x0, y0, x1, y1 = box
-    draw.rectangle(box, outline="black")
-    draw.text((x0 + 6, y0 + 6), title, fill="black")
-    if not values:
-        return
-    hist, _ = np.histogram(values, bins=20)
-    max_count = max(int(hist.max()), 1)
-    bar_width = max(1, (x1 - x0 - 20) // len(hist))
-    for index, count in enumerate(hist):
-        left = x0 + 10 + index * bar_width
-        right = left + bar_width - 1
-        top = y1 - 10 - int((y1 - y0 - 40) * (count / max_count))
-        draw.rectangle([left, top, right, y1 - 10], fill=(70, 120, 220))
-
-
-def save_distribution_plot(metrics: list[dict], output_path: Path) -> None:
-    image = Image.new("RGB", (1000, 700), "white")
-    draw = ImageDraw.Draw(image)
-    boxes = [
-        (20, 20, 490, 330),
-        (510, 20, 980, 330),
-        (20, 360, 490, 670),
-        (510, 360, 980, 670),
-    ]
-    plots = [
-        ("entropy_gap", "Entropy Gap"),
-        ("topk_gap", "Top-k Mass Gap"),
-        ("mean_js_divergence", "Mean JS Divergence"),
-        ("center_shift", "Center Shift"),
-    ]
-    for box, (key, title) in zip(boxes, plots):
-        draw_histogram_panel(draw, box, [metric[key] for metric in metrics], title)
-    image.save(output_path)
+def resize_signed_heatmap(heatmap: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    minimum = float(heatmap.min())
+    maximum = float(heatmap.max())
+    if abs(maximum - minimum) < 1e-12:
+        normalized = np.zeros_like(heatmap, dtype=np.float32)
+    else:
+        normalized = ((heatmap - minimum) / (maximum - minimum)).astype(np.float32)
+    image = Image.fromarray((normalized * 255).astype(np.uint8))
+    resized = image.resize(size, resample=Image.Resampling.BILINEAR)
+    return np.asarray(resized, dtype=np.float32) / 255.0
 
 
 def save_per_sample_figure(
     record: dict,
-    factual_question: np.ndarray,
-    factual_answer: np.ndarray,
-    hallucinated_answer: np.ndarray,
-    delta_map: np.ndarray,
+    question_map: np.ndarray,
+    factual_map: np.ndarray,
+    hallucinated_map: np.ndarray,
+    signed_delta: np.ndarray,
     output_path: Path,
 ) -> None:
-    base_image = load_image(record["image_path"])
-    panel_size = (320, 320)
-    base_panel = labeled_panel(base_image.resize(panel_size), Path(record["image_path"]).name)
-    fq_panel = labeled_panel(
-        overlay_image(base_image.resize(panel_size), factual_question),
-        "Question->Vision",
+    image = load_image(record["image_path"])
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(
+        f"{record['sample_id']} | expected={record['expected_answer']} | "
+        f"factual={record['factual_answer']} | hallucinated={record['hallucinated_answer']}",
+        fontsize=12,
     )
-    fa_panel = labeled_panel(
-        overlay_image(base_image.resize(panel_size), factual_answer),
-        f"Factual:{record['factual_answer']}",
+
+    axes[0, 0].imshow(image)
+    axes[0, 0].set_title("Image")
+    axes[0, 0].axis("off")
+
+    axes[0, 1].imshow(image)
+    im_question = axes[0, 1].imshow(
+        resize_heatmap(question_map, (image.shape[1], image.shape[0])),
+        cmap="viridis",
+        alpha=0.45,
     )
-    ha_panel = labeled_panel(
-        overlay_image(base_image.resize(panel_size), hallucinated_answer),
-        f"Hallucinated:{record['hallucinated_answer']}",
+    axes[0, 1].set_title("Question -> Vision")
+    axes[0, 1].axis("off")
+    fig.colorbar(im_question, ax=axes[0, 1], fraction=0.046, pad=0.04)
+
+    axes[0, 2].imshow(image)
+    im_factual = axes[0, 2].imshow(
+        resize_heatmap(factual_map, (image.shape[1], image.shape[0])),
+        cmap="viridis",
+        alpha=0.45,
     )
-    delta_panel = labeled_panel(
-        Image.fromarray(heatmap_to_rgb(np.abs(delta_map))).resize(panel_size),
-        "Absolute Delta",
+    axes[0, 2].set_title("Factual Token -> Vision")
+    axes[0, 2].axis("off")
+    fig.colorbar(im_factual, ax=axes[0, 2], fraction=0.046, pad=0.04)
+
+    axes[1, 0].imshow(image)
+    im_hallucinated = axes[1, 0].imshow(
+        resize_heatmap(hallucinated_map, (image.shape[1], image.shape[0])),
+        cmap="viridis",
+        alpha=0.45,
     )
-    compose_horizontal([base_panel, fq_panel, fa_panel, ha_panel, delta_panel]).save(output_path)
+    axes[1, 0].set_title("Hallucinated Token -> Vision")
+    axes[1, 0].axis("off")
+    fig.colorbar(im_hallucinated, ax=axes[1, 0], fraction=0.046, pad=0.04)
+
+    im_signed = axes[1, 1].imshow(signed_delta, cmap="bwr")
+    axes[1, 1].set_title("Signed Delta (hallucinated - factual)")
+    axes[1, 1].axis("off")
+    fig.colorbar(im_signed, ax=axes[1, 1], fraction=0.046, pad=0.04)
+
+    im_absolute = axes[1, 2].imshow(np.abs(signed_delta), cmap="magma")
+    axes[1, 2].set_title("Absolute Delta")
+    axes[1, 2].axis("off")
+    fig.colorbar(im_absolute, ax=axes[1, 2], fraction=0.046, pad=0.04)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
 
 def save_summary_heatmaps(
     mean_question: np.ndarray,
     mean_factual: np.ndarray,
     mean_hallucinated: np.ndarray,
-    mean_delta: np.ndarray,
+    mean_signed_delta: np.ndarray,
+    mean_absolute_delta: np.ndarray,
     output_path: Path,
 ) -> None:
+    fig, axes = plt.subplots(1, 5, figsize=(22, 4.8))
     panels = [
-        labeled_panel(Image.fromarray(heatmap_to_rgb(mean_question)), "Mean Question->Vision"),
-        labeled_panel(Image.fromarray(heatmap_to_rgb(mean_factual)), "Mean Factual Answer"),
-        labeled_panel(Image.fromarray(heatmap_to_rgb(mean_hallucinated)), "Mean Hallucinated Answer"),
-        labeled_panel(Image.fromarray(heatmap_to_rgb(mean_delta)), "Mean Delta"),
+        (mean_question, "Mean Question->Vision", "viridis"),
+        (mean_factual, "Mean Factual Token", "viridis"),
+        (mean_hallucinated, "Mean Hallucinated Token", "viridis"),
+        (mean_signed_delta, "Mean Signed Delta", "bwr"),
+        (mean_absolute_delta, "Mean Absolute Delta", "magma"),
     ]
-    compose_horizontal(panels).save(output_path)
+    for ax, (heatmap, title, cmap) in zip(axes, panels):
+        im = ax.imshow(heatmap, cmap=cmap)
+        ax.set_title(title)
+        ax.axis("off")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_layer_divergence_plot(js_curve: np.ndarray, cosine_curve: np.ndarray, output_path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    layers = np.arange(len(js_curve))
+    ax.plot(layers, js_curve, label="JS divergence", color="tab:red", linewidth=2)
+    ax.plot(layers, cosine_curve, label="Cosine similarity", color="tab:blue", linewidth=2)
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Value")
+    ax.set_title("Layer-wise divergence between factual and hallucinated token attention")
+    ax.legend()
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_metric_distributions(metrics: list[dict], output_path: Path) -> None:
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    plots = [
+        ("alignment_gap", "Alignment gap"),
+        ("entropy_gap", "Entropy gap"),
+        ("topk_gap", "Top-k mass gap"),
+        ("center_shift", "Center shift"),
+        ("mean_js_divergence", "Mean JS divergence"),
+        ("mean_cosine_similarity", "Mean cosine similarity"),
+    ]
+    for ax, (key, title) in zip(axes.flat, plots):
+        ax.hist([metric[key] for metric in metrics], bins=20, color="tab:blue", alpha=0.8)
+        ax.set_title(title)
+        ax.grid(alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_pca(features: np.ndarray, n_components: int = 2) -> tuple[np.ndarray, PCA, np.ndarray]:
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(features)
+    component_count = min(n_components, scaled.shape[0], scaled.shape[1])
+    pca = PCA(n_components=component_count)
+    coords = pca.fit_transform(scaled)
+    return coords, pca, scaled
+
+
+def save_pca_scatter(coords: np.ndarray, labels: np.ndarray, output_path: Path, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 6))
+    factual = labels == 0
+    hallucinated = labels == 1
+    ax.scatter(coords[factual, 0], coords[factual, 1], label="Factual", color="tab:blue", alpha=0.8)
+    ax.scatter(
+        coords[hallucinated, 0],
+        coords[hallucinated, 1],
+        label="Hallucinated",
+        color="tab:red",
+        alpha=0.8,
+    )
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_explained_variance_plot(pca: PCA, output_path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ratios = pca.explained_variance_ratio_
+    cumulative = np.cumsum(ratios)
+    components = np.arange(1, len(ratios) + 1)
+    ax.plot(components, ratios, marker="o", label="Per-component variance")
+    ax.plot(components, cumulative, marker="s", label="Cumulative variance")
+    ax.set_xlabel("Principal component")
+    ax.set_ylabel("Explained variance ratio")
+    ax.set_title("All-layer PCA explained variance")
+    ax.legend()
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def pairwise_centroid_distance(coords: np.ndarray, labels: np.ndarray) -> float:
+    factual = coords[labels == 0]
+    hallucinated = coords[labels == 1]
+    return float(np.linalg.norm(factual.mean(axis=0) - hallucinated.mean(axis=0)))
+
+
+def rank_layers(token_samples: list[dict], output_path: Path) -> list[dict]:
+    labels = np.array([sample["label"] for sample in token_samples], dtype=int)
+    layer_count = token_samples[0]["attention_stack"].shape[0]
+    target_hw = (
+        max(sample["attention_stack"].shape[1] for sample in token_samples),
+        max(sample["attention_stack"].shape[2] for sample in token_samples),
+    )
+    resized_stacks = [resize_stack(sample["attention_stack"], target_hw) for sample in token_samples]
+    rows: list[dict] = []
+    for layer_idx in range(layer_count):
+        features = np.stack([stack[layer_idx].reshape(-1) for stack in resized_stacks], axis=0)
+        coords, pca, _ = run_pca(features, n_components=2)
+        row = {
+            "layer_index": layer_idx,
+            "pc1_variance_ratio": float(pca.explained_variance_ratio_[0]),
+            "pc2_variance_ratio": float(
+                pca.explained_variance_ratio_[1] if len(pca.explained_variance_ratio_) > 1 else 0.0
+            ),
+            "pca_centroid_distance": pairwise_centroid_distance(coords[:, :2], labels),
+            "feature_dim": int(features.shape[1]),
+        }
+        rows.append(row)
+    rows.sort(key=lambda item: item["pca_centroid_distance"], reverse=True)
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "layer_index",
+                "pc1_variance_ratio",
+                "pc2_variance_ratio",
+                "pca_centroid_distance",
+                "feature_dim",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return rows
+
+
+def rank_layer_bands(token_samples: list[dict], band_width: int, output_path: Path) -> list[dict]:
+    labels = np.array([sample["label"] for sample in token_samples], dtype=int)
+    layer_count = token_samples[0]["attention_stack"].shape[0]
+    target_hw = (
+        max(sample["attention_stack"].shape[1] for sample in token_samples),
+        max(sample["attention_stack"].shape[2] for sample in token_samples),
+    )
+    resized_stacks = [resize_stack(sample["attention_stack"], target_hw) for sample in token_samples]
+    rows: list[dict] = []
+    for start in range(0, layer_count - band_width + 1):
+        end = start + band_width
+        features = np.stack([stack[start:end].reshape(-1) for stack in resized_stacks], axis=0)
+        coords, pca, _ = run_pca(features, n_components=2)
+        rows.append(
+            {
+                "start_layer": start,
+                "end_layer": end - 1,
+                "band_width": band_width,
+                "pc1_variance_ratio": float(pca.explained_variance_ratio_[0]),
+                "pc2_variance_ratio": float(
+                    pca.explained_variance_ratio_[1] if len(pca.explained_variance_ratio_) > 1 else 0.0
+                ),
+                "pca_centroid_distance": pairwise_centroid_distance(coords[:, :2], labels),
+            }
+        )
+    rows.sort(key=lambda item: item["pca_centroid_distance"], reverse=True)
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "start_layer",
+                "end_layer",
+                "band_width",
+                "pc1_variance_ratio",
+                "pc2_variance_ratio",
+                "pca_centroid_distance",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return rows
+
+
+def save_top_layer_spotlight(
+    token_samples: list[dict], layer_rows: list[dict], output_path: Path, top_layer_count: int
+) -> None:
+    top_layers = [row["layer_index"] for row in layer_rows[:top_layer_count]]
+    target_hw = (
+        max(sample["attention_stack"].shape[1] for sample in token_samples),
+        max(sample["attention_stack"].shape[2] for sample in token_samples),
+    )
+    resized_stacks = [
+        resize_stack(sample["attention_stack"], target_hw) for sample in token_samples
+    ]
+    fig, axes = plt.subplots(len(top_layers), 3, figsize=(11, 3.2 * len(top_layers)))
+    if len(top_layers) == 1:
+        axes = np.array([axes])
+    for row_axes, layer_idx in zip(axes, top_layers):
+        factual_mean = np.mean(
+            [
+                stack[layer_idx]
+                for stack, sample in zip(resized_stacks, token_samples)
+                if sample["label"] == 0
+            ],
+            axis=0,
+        )
+        hallucinated_mean = np.mean(
+            [
+                stack[layer_idx]
+                for stack, sample in zip(resized_stacks, token_samples)
+                if sample["label"] == 1
+            ],
+            axis=0,
+        )
+        delta = hallucinated_mean - factual_mean
+        row_axes[0].imshow(factual_mean, cmap="viridis")
+        row_axes[0].set_title(f"Layer {layer_idx} factual")
+        row_axes[1].imshow(hallucinated_mean, cmap="viridis")
+        row_axes[1].set_title(f"Layer {layer_idx} hallucinated")
+        row_axes[2].imshow(delta, cmap="bwr")
+        row_axes[2].set_title(f"Layer {layer_idx} delta")
+        for ax in row_axes:
+            ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_report_json(path: Path, payload: dict) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
 
 
 def write_metrics_csv(metrics: list[dict], output_path: Path) -> None:
     fieldnames = [
-        "image_path",
+        "sample_id",
         "object_label",
+        "expected_answer",
         "factual_answer",
         "hallucinated_answer",
         "question_factual_alignment",
@@ -317,123 +412,156 @@ def main() -> int:
     output_dir = Path(args.output_dir).expanduser().resolve()
     per_sample_dir = output_dir / "per_sample"
     summary_dir = output_dir / "dataset_summary"
+    pca_dir = output_dir / "pca"
+    layer_dir = output_dir / "layer_analysis"
     per_sample_dir.mkdir(parents=True, exist_ok=True)
     summary_dir.mkdir(parents=True, exist_ok=True)
+    pca_dir.mkdir(parents=True, exist_ok=True)
+    layer_dir.mkdir(parents=True, exist_ok=True)
 
     records = load_records(input_path)
     if not records:
         raise SystemExit("No records found in attention JSONL.")
 
+    token_samples = build_token_samples(records, topk_fraction=args.topk_fraction)
+    labels = np.array([sample["label"] for sample in token_samples], dtype=int)
+    target_hw = (
+        max(sample["attention_stack"].shape[1] for sample in token_samples),
+        max(sample["attention_stack"].shape[2] for sample in token_samples),
+    )
+    resized_stacks = [resize_stack(sample["attention_stack"], target_hw) for sample in token_samples]
+    all_features = np.stack([stack.reshape(-1) for stack in resized_stacks], axis=0)
+
     summary_question = np.zeros((args.summary_size, args.summary_size), dtype=np.float64)
     summary_factual = np.zeros((args.summary_size, args.summary_size), dtype=np.float64)
     summary_hallucinated = np.zeros((args.summary_size, args.summary_size), dtype=np.float64)
-    summary_delta = np.zeros((args.summary_size, args.summary_size), dtype=np.float64)
-    layer_js_curves: list[np.ndarray] = []
-    layer_cosine_curves: list[np.ndarray] = []
+    summary_signed_delta = np.zeros((args.summary_size, args.summary_size), dtype=np.float64)
+    summary_absolute_delta = np.zeros((args.summary_size, args.summary_size), dtype=np.float64)
+    js_curves: list[np.ndarray] = []
+    cosine_curves: list[np.ndarray] = []
     metrics: list[dict] = []
 
     for index, record in enumerate(records):
-        factual_question_block = record["factual_question_attention"]
+        factual_question_map = block_mean_map(record["factual_question_attention"])
         factual_answer_block = answer_block(record["factual_trace"])
         hallucinated_answer_block = answer_block(record["hallucinated_trace"])
-
-        factual_question_map = block_mean_map(factual_question_block)
         factual_answer_map = block_mean_map(factual_answer_block)
         hallucinated_answer_map = block_mean_map(hallucinated_answer_block)
-        delta_map = hallucinated_answer_map - factual_answer_map
+        signed_delta = hallucinated_answer_map - factual_answer_map
 
         summary_question += resize_heatmap(factual_question_map, (args.summary_size, args.summary_size))
         summary_factual += resize_heatmap(factual_answer_map, (args.summary_size, args.summary_size))
         summary_hallucinated += resize_heatmap(
             hallucinated_answer_map, (args.summary_size, args.summary_size)
         )
-        summary_delta += resize_heatmap(np.abs(delta_map), (args.summary_size, args.summary_size))
+        summary_signed_delta += resize_signed_heatmap(signed_delta, (args.summary_size, args.summary_size))
+        summary_absolute_delta += resize_heatmap(np.abs(signed_delta), (args.summary_size, args.summary_size))
 
         factual_stack = block_layer_stack(factual_answer_block)
         hallucinated_stack = block_layer_stack(hallucinated_answer_block)
         layer_count = min(factual_stack.shape[0], hallucinated_stack.shape[0])
-        js_curve = np.array(
-            [
-                js_divergence(factual_stack[layer_idx], hallucinated_stack[layer_idx])
-                for layer_idx in range(layer_count)
-            ],
-            dtype=np.float64,
-        )
-        cosine_curve = np.array(
-            [
-                cosine_similarity(factual_stack[layer_idx], hallucinated_stack[layer_idx])
-                for layer_idx in range(layer_count)
-            ],
-            dtype=np.float64,
-        )
-        layer_js_curves.append(js_curve)
-        layer_cosine_curves.append(cosine_curve)
+        factual_stack = factual_stack[:layer_count]
+        hallucinated_stack = hallucinated_stack[:layer_count]
+        js_curve = layer_js_curve(factual_stack, hallucinated_stack)
+        cosine_curve = layer_cosine_curve(factual_stack, hallucinated_stack)
+        js_curves.append(js_curve)
+        cosine_curves.append(cosine_curve)
 
-        alignment_factual = cosine_similarity(factual_question_map, factual_answer_map)
-        alignment_hallucinated = cosine_similarity(factual_question_map, hallucinated_answer_map)
-        entropy_gap = entropy_score(hallucinated_answer_map) - entropy_score(factual_answer_map)
-        topk_gap = topk_mass(hallucinated_answer_map, args.topk_fraction) - topk_mass(
-            factual_answer_map, args.topk_fraction
-        )
-        drift = center_shift(factual_answer_map, hallucinated_answer_map)
+        factual_alignment = cosine_similarity(factual_question_map, factual_answer_map)
+        hallucinated_alignment = cosine_similarity(factual_question_map, hallucinated_answer_map)
+        factual_entropy = entropy_score(factual_answer_map)
+        hallucinated_entropy = entropy_score(hallucinated_answer_map)
+        factual_topk = topk_mass(factual_answer_map, args.topk_fraction)
+        hallucinated_topk = topk_mass(hallucinated_answer_map, args.topk_fraction)
         mean_js = float(js_curve.mean()) if len(js_curve) else 0.0
         mean_cos = float(cosine_curve.mean()) if len(cosine_curve) else 0.0
-        discriminability = mean_js + drift + abs(alignment_factual - alignment_hallucinated)
-
+        drift = center_shift(factual_answer_map, hallucinated_answer_map)
         metrics.append(
             {
-                "image_path": record["image_path"],
+                "sample_id": record["sample_id"],
                 "object_label": record["object_label"],
+                "expected_answer": record.get("expected_answer", "yes"),
                 "factual_answer": record["factual_answer"],
                 "hallucinated_answer": record["hallucinated_answer"],
-                "question_factual_alignment": alignment_factual,
-                "question_hallucinated_alignment": alignment_hallucinated,
-                "alignment_gap": alignment_factual - alignment_hallucinated,
-                "entropy_gap": entropy_gap,
-                "topk_gap": topk_gap,
+                "question_factual_alignment": factual_alignment,
+                "question_hallucinated_alignment": hallucinated_alignment,
+                "alignment_gap": factual_alignment - hallucinated_alignment,
+                "entropy_gap": hallucinated_entropy - factual_entropy,
+                "topk_gap": hallucinated_topk - factual_topk,
                 "center_shift": drift,
                 "mean_js_divergence": mean_js,
                 "mean_cosine_similarity": mean_cos,
-                "discriminability_score": discriminability,
+                "discriminability_score": mean_js + drift + abs(factual_alignment - hallucinated_alignment),
             }
         )
-
         if index < args.per_sample_limit:
-            output_path = per_sample_dir / f"{index:03d}_{Path(record['image_path']).stem}.png"
             save_per_sample_figure(
                 record=record,
-                factual_question=factual_question_map,
-                factual_answer=factual_answer_map,
-                hallucinated_answer=hallucinated_answer_map,
-                delta_map=delta_map,
-                output_path=output_path,
+                question_map=factual_question_map,
+                factual_map=factual_answer_map,
+                hallucinated_map=hallucinated_answer_map,
+                signed_delta=signed_delta,
+                output_path=per_sample_dir / f"{index:03d}_{record['sample_id']}.png",
             )
 
     sample_count = max(1, len(records))
     save_summary_heatmaps(
-        mean_question=(summary_question / sample_count),
-        mean_factual=(summary_factual / sample_count),
-        mean_hallucinated=(summary_hallucinated / sample_count),
-        mean_delta=(summary_delta / sample_count),
+        mean_question=summary_question / sample_count,
+        mean_factual=summary_factual / sample_count,
+        mean_hallucinated=summary_hallucinated / sample_count,
+        mean_signed_delta=summary_signed_delta / sample_count,
+        mean_absolute_delta=summary_absolute_delta / sample_count,
         output_path=summary_dir / "mean_heatmaps.png",
     )
-
-    min_layers = min(len(curve) for curve in layer_js_curves)
-    js_curve = np.mean([curve[:min_layers] for curve in layer_js_curves], axis=0)
-    cosine_curve = np.mean([curve[:min_layers] for curve in layer_cosine_curves], axis=0)
-    draw_line_plot(
-        curves=[
-            (js_curve, "JS Divergence", (220, 80, 80)),
-            (cosine_curve, "Cosine Similarity", (60, 110, 220)),
-        ],
-        title="Layer-wise Branch Divergence",
-        y_label="Value",
+    min_layers = min(len(curve) for curve in js_curves)
+    save_layer_divergence_plot(
+        js_curve=np.mean([curve[:min_layers] for curve in js_curves], axis=0),
+        cosine_curve=np.mean([curve[:min_layers] for curve in cosine_curves], axis=0),
         output_path=summary_dir / "layer_divergence.png",
     )
-
     metrics.sort(key=lambda item: item["discriminability_score"], reverse=True)
     write_metrics_csv(metrics, summary_dir / "attention_discriminability.csv")
-    save_distribution_plot(metrics, summary_dir / "metric_distributions.png")
+    save_metric_distributions(metrics, summary_dir / "metric_distributions.png")
+
+    all_coords, all_pca, _ = run_pca(all_features, n_components=8)
+    save_pca_scatter(
+        coords=all_coords[:, :2],
+        labels=labels,
+        output_path=pca_dir / "all_layer_token_pca_scatter.png",
+        title="All-layer token PCA",
+    )
+    save_explained_variance_plot(all_pca, pca_dir / "all_layer_explained_variance.png")
+
+    layer_rows = rank_layers(token_samples, layer_dir / "layer_pca_ranking.csv")
+    band_rows = rank_layer_bands(token_samples, args.band_width, layer_dir / "layer_band_pca_ranking.csv")
+    save_top_layer_spotlight(
+        token_samples=token_samples,
+        layer_rows=layer_rows,
+        output_path=layer_dir / "top_layer_spotlight.png",
+        top_layer_count=args.top_layer_count,
+    )
+    top_layer = layer_rows[0]["layer_index"]
+    top_layer_features = np.stack(
+        [stack[top_layer].reshape(-1) for stack in resized_stacks],
+        axis=0,
+    )
+    top_layer_coords, _, _ = run_pca(top_layer_features, n_components=2)
+    save_pca_scatter(
+        coords=top_layer_coords,
+        labels=labels,
+        output_path=layer_dir / f"top_layer_{top_layer:02d}_pca_scatter.png",
+        title=f"Top layer PCA (layer {top_layer})",
+    )
+    save_report_json(
+        layer_dir / "layer_analysis_report.json",
+        {
+            "record_count": len(records),
+            "token_sample_count": len(token_samples),
+            "top_layers": layer_rows[: args.top_layer_count],
+            "top_bands": band_rows[: args.top_layer_count],
+            "all_layer_pca_explained_variance_ratio": all_pca.explained_variance_ratio_.tolist(),
+        },
+    )
     return 0
 
 

@@ -1,0 +1,93 @@
+{
+  "record_count": 89,
+  "token_sample_count": 178,
+  "top_layers": [
+    {
+      "layer_index": 18,
+      "pc1_variance_ratio": 0.33446257414916664,
+      "pc2_variance_ratio": 0.03670185114288901,
+      "pca_centroid_distance": 28.225932221767625,
+      "feature_dim": 697
+    },
+    {
+      "layer_index": 0,
+      "pc1_variance_ratio": 0.47029623903558254,
+      "pc2_variance_ratio": 0.045237508523235596,
+      "pca_centroid_distance": 24.77084520616048,
+      "feature_dim": 697
+    },
+    {
+      "layer_index": 20,
+      "pc1_variance_ratio": 0.26384229337011383,
+      "pc2_variance_ratio": 0.03315170996409087,
+      "pca_centroid_distance": 23.954115234804668,
+      "feature_dim": 697
+    },
+    {
+      "layer_index": 19,
+      "pc1_variance_ratio": 0.24495071904399066,
+      "pc2_variance_ratio": 0.04021379134220267,
+      "pca_centroid_distance": 23.236866811760216,
+      "feature_dim": 697
+    },
+    {
+      "layer_index": 7,
+      "pc1_variance_ratio": 0.2751122254267692,
+      "pc2_variance_ratio": 0.05545048849907705,
+      "pca_centroid_distance": 21.421055705926015,
+      "feature_dim": 697
+    }
+  ],
+  "top_bands": [
+    {
+      "start_layer": 18,
+      "end_layer": 20,
+      "band_width": 3,
+      "pc1_variance_ratio": 0.2726163112526016,
+      "pc2_variance_ratio": 0.033945297670654226,
+      "pca_centroid_distance": 43.73205443860662
+    },
+    {
+      "start_layer": 17,
+      "end_layer": 19,
+      "band_width": 3,
+      "pc1_variance_ratio": 0.23339597485990995,
+      "pc2_variance_ratio": 0.037544408887086836,
+      "pca_centroid_distance": 40.328479258939204
+    },
+    {
+      "start_layer": 19,
+      "end_layer": 21,
+      "band_width": 3,
+      "pc1_variance_ratio": 0.22746894864809544,
+      "pc2_variance_ratio": 0.03292661157848862,
+      "pca_centroid_distance": 38.18931326854521
+    },
+    {
+      "start_layer": 16,
+      "end_layer": 18,
+      "band_width": 3,
+      "pc1_variance_ratio": 0.19261142712228949,
+      "pc2_variance_ratio": 0.040377067604712984,
+      "pca_centroid_distance": 35.50277219497203
+    },
+    {
+      "start_layer": 20,
+      "end_layer": 22,
+      "band_width": 3,
+      "pc1_variance_ratio": 0.1858582486232211,
+      "pc2_variance_ratio": 0.033738758965560646,
+      "pca_centroid_distance": 33.889529510549536
+    }
+  ],
+  "all_layer_pca_explained_variance_ratio": [
+    0.1263511070527484,
+    0.043592045999534194,
+    0.03133709176334755,
+    0.02753404120182333,
+    0.026721340900257233,
+    0.026018442897290155,
+    0.0235573364880253,
+    0.02145483263041839
+  ]
+}

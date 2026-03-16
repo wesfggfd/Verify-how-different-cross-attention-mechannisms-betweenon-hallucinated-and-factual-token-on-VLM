@@ -1,189 +1,181 @@
 # Verify How Different Cross-Attention Mechanisms Behave Between Hallucinated and Factual Tokens on VLM
 
 ## Overview
-This repository studies whether `Q(text) -> K(image)` cross-attention can separate factual answer tokens from hallucinated answer tokens in a vision-language model.
+This repository studies whether answer-token `Q(text) -> K(image)` cross-attention can distinguish factual and hallucinated responses in `Qwen2.5-VL-7B-Instruct`.
 
-The experiment uses `Qwen2.5-VL-7B-Instruct` on 100 ImageNette images with yes/no questions of the form:
+The current experiment uses 100 `ImageNette` images with fixed binary prompts:
 
 - `Is there a/an [object] in the image?`
 
 For each image-question pair, the pipeline generates:
 
-- a factual answer token
-- a hallucinated answer token that is forced to be the opposite of the factual answer
+- a factual answer token, expected to be `yes`
+- a hallucinated answer token, forced to be the opposite answer `no`
 
-Then it exports and visualizes:
+For both branches, the code exports the answer token's cross-attention map for every layer, along with the question-token cross-attention map.
 
-- `question -> vision` cross-attention
-- `factual answer token -> vision` cross-attention
-- `hallucinated answer token -> vision` cross-attention
-- `delta = hallucinated - factual`
+## Dataset And Protocol
+The dataset is built from a balanced 100-image `ImageNette` subset stored in:
 
-## Core Question
-Can hallucinated and factual answer tokens be separated using cross-attention statistics?
+- `outputs/imagenette_subset_100.jsonl`
 
-This repository evaluates two hypotheses:
+Each record contains:
 
-1. A scalar threshold exists that can separate hallucinated and factual tokens.
-2. A low-dimensional linear hyperplane exists that separates them even better.
+- `sample_id`
+- `image_path`
+- `class_id`
+- `object_label`
+- `question`
+- `expected_answer`
+- `hallucinated_answer_target`
 
-## Method
-### Attention definition
-The analysis uses the attention weights produced by the language model when:
+The generation protocol is:
 
-- text tokens are the query `Q`
-- image tokens are the key `K`
+1. factual branch: `image + question -> yes`
+2. hallucination branch: `image + question -> forced no`
+3. export per-layer cross-attention maps for the answer token in both branches
 
-In practice, we analyze:
+Out of 100 inputs, 89 records were valid contrastive samples where:
 
-- question token set -> merged image token grid
-- factual answer token -> merged image token grid
-- hallucinated answer token -> merged image token grid
+- the factual branch answered `yes`
+- the hallucination branch produced the forced `no`
 
-### Spatial reconstruction
-`Qwen2.5-VL` merges image tokens before the language model. In this setup the merged attention grid is `11 x 17`, which is reconstructed into 2D spatial heatmaps.
+## What Is Recorded
+Every valid record stores:
 
-### Token-level samples
-Each original record yields two token samples:
+- `factual_question_attention`
+- `hallucinated_question_attention`
+- `factual_trace`
+- `hallucinated_trace`
+- `factual_meta`
+- `hallucinated_meta`
 
-- class `0`: factual answer token
-- class `1`: hallucinated answer token
+Each answer trace contains the generated token, token id, and a `cross_attention` object with:
 
-For every token sample we compute features such as:
+- `layer_maps`: one 2D attention map per layer
+- `layer_summary`: mean, early, middle, and late layer summaries
 
-- `question_alignment`
-- `question_center_shift`
-- `answer_entropy`
-- `answer_topk_mass`
-- `answer_peak_value`
-- `answer_mean_value`
-- `pair_js_divergence`
-- `pair_cosine_similarity`
-- `pair_center_shift`
+That means this repository keeps the full layerwise attention map for the factual token and the hallucinated token, not only aggregated statistics.
 
-## Main Visualizations
-### Dataset-level summary
+## Main Results
+### Dataset summary heatmaps
 
-![Mean heatmaps](outputs/qwen_attention_100/visualizations/dataset_summary/mean_heatmaps.png)
+![Mean heatmaps](outputs/qwen_attention_imagenette_100/viz/dataset_summary/mean_heatmaps.png)
 
-This panel summarizes:
+This figure summarizes the dataset-level mean attention for:
 
-- mean `question -> vision`
-- mean `factual answer -> vision`
-- mean `hallucinated answer -> vision`
-- mean absolute delta
+- question -> vision
+- factual token -> vision
+- hallucinated token -> vision
+- signed delta
+- absolute delta
 
-### Layer-wise divergence
+### Layer divergence
 
-![Layer divergence](outputs/qwen_attention_100/visualizations/dataset_summary/layer_divergence.png)
+![Layer divergence](outputs/qwen_attention_imagenette_100/viz/dataset_summary/layer_divergence.png)
 
-This figure shows how factual and hallucinated branches diverge across layers.
+The divergence curve shows that the factual and hallucinated token branches do not separate uniformly across depth. The strongest differences concentrate in a smaller subset of layers rather than being evenly spread across the whole network.
 
-### Metric distributions
+### All-layer PCA
 
-![Metric distributions](outputs/qwen_attention_100/visualizations/dataset_summary/metric_distributions.png)
+![All-layer PCA](outputs/qwen_attention_imagenette_100/viz/pca/all_layer_token_pca_scatter.png)
 
-This figure summarizes the distribution of several discriminative statistics over the 100-image dataset.
+This PCA uses flattened layerwise answer-token attention features across all layers. The two token classes already occupy visibly different regions.
 
-### Separability scatter views
+### Top-layer spotlight
 
-![Question alignment vs answer mean value](outputs/qwen_attention_100/visualizations/dataset_summary/separability/pairwise_scatter_answer_mean_value_vs_question_alignment.png)
+![Top-layer spotlight](outputs/qwen_attention_imagenette_100/viz/layer_analysis/top_layer_spotlight.png)
 
-![Question alignment vs answer peak value](outputs/qwen_attention_100/visualizations/dataset_summary/separability/pairwise_scatter_answer_peak_value_vs_question_alignment.png)
+This panel visualizes the strongest single layers discovered by layer-wise PCA ranking.
 
-These pairwise projections already show that factual and hallucinated tokens occupy different regions of feature space, especially when `question_alignment` is combined with answer-attention magnitude features.
+### High-dimensional classifier
 
-## Separability Results
-The strongest scalar threshold found in this experiment is:
+![High-dimensional confusion matrix](outputs/qwen_attention_imagenette_100/analysis/highdim_logistic_confusion_matrix.png)
 
-- feature: `answer_mean_value`
-- rule: `answer_mean_value <= 0.00022780504853775103`
-- balanced accuracy: `0.955`
-- precision: `0.9505`
-- recall: `0.96`
+The strongest classifier in this run is the high-dimensional logistic regression trained on resized layerwise attention features.
 
-This means a simple threshold on the average spatial attention mass is already highly informative for distinguishing hallucinated tokens from factual tokens.
+## PCA And Important Layers
+The layer ranking report is stored in:
 
-The strongest low-dimensional linear separator uses:
+- `outputs/qwen_attention_imagenette_100/viz/layer_analysis/layer_analysis_report.json`
 
-- `question_alignment`
-- `answer_topk_mass`
-- `answer_mean_value`
-- `pair_cosine_similarity`
+The strongest individual layers are:
 
-Its performance is:
+1. layer `18`
+2. layer `0`
+3. layer `20`
+4. layer `19`
+5. layer `7`
 
-- balanced accuracy: `0.975`
-- accuracy: `0.975`
-- precision: `0.9703`
-- recall: `0.98`
+The strongest contiguous 3-layer bands are:
 
-The corresponding linear model weights are:
+1. layers `18-20`
+2. layers `17-19`
+3. layers `19-21`
+4. layers `16-18`
+5. layers `20-22`
 
-- `question_alignment`: `-1.2532`
-- `answer_topk_mass`: `-1.0133`
-- `answer_mean_value`: `-5.9686`
-- `pair_cosine_similarity`: `0.6419`
+This suggests the most useful factual-vs-hallucinated separation is concentrated around a late-middle band centered near layers `18-20`.
 
-## Interpretation
-The current evidence supports both conclusions:
+## Classifier Performance
+The full classifier report is stored in:
 
-1. A useful scalar threshold exists.
-2. A stronger low-dimensional linear separator also exists.
+- `outputs/qwen_attention_imagenette_100/analysis/classifier_summary.json`
 
-So the gap between factual and hallucinated tokens is not only a vague statistical tendency. It is strong enough to produce:
+Key results on 89 valid records / 178 token samples:
 
-- a near-threshold mechanism
-- an even cleaner linear separation in a small feature space
+- high-dimensional logistic regression:
+  - mean cross-validation accuracy: `0.9941`
+  - mean balanced accuracy: `0.9941`
+  - mean precision: `0.9889`
+  - mean recall: `1.0000`
+  - mean ROC-AUC: `0.9896`
+- scalar logistic baseline:
+  - mean cross-validation accuracy: `0.9546`
+  - mean balanced accuracy: `0.9546`
+  - mean precision: `0.9450`
+  - mean recall: `0.9660`
+  - mean ROC-AUC: `0.9913`
 
-This suggests hallucinated answer tokens are systematically different from factual answer tokens in how they align to question evidence and image-space attention statistics.
+So the high-dimensional classifier clearly improves over the scalar baseline, which supports the idea that the full layerwise spatial attention pattern carries richer class information than low-dimensional summary statistics alone.
 
-## Representative High-Separation Cases
-The most discriminative samples in the current run include:
-
-1. `chain saw` with factual `yes` and hallucinated `no`
-2. `cassette player` with factual `no` and hallucinated `yes`
-3. `tench` with factual `yes` and hallucinated `no`
-
-Representative overlays:
-
-![Top sample chain saw](outputs/qwen_attention_100/visualizations/per_sample/003_n03000684_11861.png)
-
-![Top sample cassette player](outputs/qwen_attention_100/visualizations/per_sample/091_n02979186_5321.png)
-
-![Top sample tench](outputs/qwen_attention_100/visualizations/per_sample/047_n01440764_8622.png)
-
-Their exact scores are recorded in:
-
-- `outputs/qwen_attention_100/visualizations/dataset_summary/attention_discriminability.csv`
-
-## Generated Artifacts
-### Outputs
-- `outputs/qwen_attention_100/attention_records.jsonl`
-- `outputs/qwen_attention_100/visualizations/per_sample/`
-- `outputs/qwen_attention_100/visualizations/dataset_summary/`
-- `outputs/qwen_attention_100/visualizations/dataset_summary/separability/`
-
+## Repository Layout
 ### Scripts
+
+- `scripts/prepare_imagenette_subset.py`
 - `scripts/run_qwen_attention.py`
 - `scripts/visualize_qwen_attention.py`
 - `scripts/analyze_attention_separability.py`
+- `scripts/attention_binary_utils.py`
 - `scripts/run_qwen_attention_100.sh`
 
+### Outputs
+
+- `outputs/imagenette_subset_100.jsonl`
+- `outputs/qwen_attention_imagenette_100/all_records.jsonl`
+- `outputs/qwen_attention_imagenette_100/valid_records.jsonl`
+- `outputs/qwen_attention_imagenette_100/failures.csv`
+- `outputs/qwen_attention_imagenette_100/viz/`
+- `outputs/qwen_attention_imagenette_100/analysis/`
+
 ## Reproducibility
-The end-to-end run is orchestrated by:
+The full remote pipeline is wrapped by:
 
 ```bash
 ./scripts/run_qwen_attention_100.sh
 ```
 
-The separability analysis is generated by:
+The three stages are:
 
-```bash
-python scripts/analyze_attention_separability.py \
-  --input-jsonl outputs/qwen_attention_100/attention_records.jsonl \
-  --output-dir outputs/qwen_attention_100/visualizations/dataset_summary/separability
-```
+1. build the 100-image `ImageNette` subset
+2. run factual/hallucinated token tracing with `Qwen2.5-VL-7B-Instruct`
+3. run `matplotlib` visualization, PCA ranking, and high-dimensional classifier analysis
 
 ## Takeaway
-Under this `Q(text) -> K(image)` cross-attention analysis, hallucinated answer tokens are not merely noisy variants of factual tokens. They occupy a measurably different region of attention-feature space, and that difference is strong enough to support both a scalar threshold and a low-dimensional linear separator.
+Under this binary `ImageNette` setting, factual and hallucinated answer tokens are not merely noisy variants of each other. Their layerwise spatial cross-attention maps are strongly separable:
+
+- PCA identifies a small set of especially informative layers
+- the strongest band is concentrated around layers `18-20`
+- a high-dimensional classifier reaches near-perfect balanced accuracy on token labeling
+
+This provides strong evidence that factual and hallucinated tokens occupy different regions of attention space when the model answers the same image-grounded yes/no question.

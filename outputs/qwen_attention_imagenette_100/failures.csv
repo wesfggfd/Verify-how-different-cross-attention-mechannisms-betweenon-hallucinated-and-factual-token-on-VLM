@@ -1,0 +1,12 @@
+sample_id,object_label,expected_answer,factual_answer,hallucinated_answer,hallucination_target,reason
+imagenette_013_n03445777,golf ball,yes,no,no,no,factual_incorrect
+imagenette_035_n02102040,English springer,yes,no,no,no,factual_incorrect
+imagenette_037_n01440764,tench,yes,no,no,no,factual_incorrect
+imagenette_039_n02979186,cassette player,yes,no,no,no,factual_incorrect
+imagenette_049_n01440764,tench,yes,no,no,no,factual_incorrect
+imagenette_055_n01440764,tench,yes,no,no,no,factual_incorrect
+imagenette_065_n03888257,parachute,yes,no,no,no,factual_incorrect
+imagenette_074_n03417042,garbage truck,yes,no,no,no,factual_incorrect
+imagenette_081_n01440764,tench,yes,no,no,no,factual_incorrect
+imagenette_086_n03888257,parachute,yes,no,no,no,factual_incorrect
+imagenette_092_n02979186,cassette player,yes,no,no,no,factual_incorrect

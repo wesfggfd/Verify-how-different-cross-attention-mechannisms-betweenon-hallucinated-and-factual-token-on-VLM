@@ -1,0 +1,31 @@
+sample_id,object_label,label_name,expected_answer,factual_answer,hallucinated_answer,score,prediction,correct,abs_margin
+imagenette_041_n03888257,parachute,hallucinated,yes,yes,no,3.503611773761762,1,1,3.503611773761762
+imagenette_057_n03888257,parachute,factual,yes,yes,no,-5.905856349377353,0,1,5.905856349377353
+imagenette_036_n03394916,French horn,factual,yes,yes,no,-7.028522410932004,0,1,7.028522410932004
+imagenette_089_n03028079,church,factual,yes,yes,no,-7.33988526164579,0,1,7.33988526164579
+imagenette_017_n03394916,French horn,factual,yes,yes,no,-7.459165964098271,0,1,7.459165964098271
+imagenette_045_n03028079,church,hallucinated,yes,yes,no,7.79753204362651,1,1,7.79753204362651
+imagenette_012_n03888257,parachute,factual,yes,yes,no,-8.303218245784294,0,1,8.303218245784294
+imagenette_014_n02102040,English springer,hallucinated,yes,yes,no,8.46683602759612,1,1,8.46683602759612
+imagenette_061_n01440764,tench,hallucinated,yes,yes,no,9.295171738970563,1,1,9.295171738970563
+imagenette_046_n03394916,French horn,factual,yes,yes,no,-9.31505830505473,0,1,9.31505830505473
+imagenette_019_n03028079,church,hallucinated,yes,yes,no,9.581823978866284,1,1,9.581823978866284
+imagenette_022_n02102040,English springer,hallucinated,yes,yes,no,9.645572992979,1,1,9.645572992979
+imagenette_073_n03417042,garbage truck,factual,yes,yes,no,-9.720167040001941,0,1,9.720167040001941
+imagenette_015_n03417042,garbage truck,hallucinated,yes,yes,no,9.721448842469075,1,1,9.721448842469075
+imagenette_003_n03000684,chain saw,hallucinated,yes,yes,no,9.792241935099526,1,1,9.792241935099526
+imagenette_036_n03394916,French horn,hallucinated,yes,yes,no,9.984765150467783,1,1,9.984765150467783
+imagenette_020_n03394916,French horn,factual,yes,yes,no,-9.993815100807184,0,1,9.993815100807184
+imagenette_073_n03417042,garbage truck,hallucinated,yes,yes,no,10.110913536700023,1,1,10.110913536700023
+imagenette_017_n03394916,French horn,hallucinated,yes,yes,no,10.222124699921952,1,1,10.222124699921952
+imagenette_019_n03028079,church,factual,yes,yes,no,-10.593019990139382,0,1,10.593019990139382
+imagenette_089_n03028079,church,hallucinated,yes,yes,no,10.69922921723111,1,1,10.69922921723111
+imagenette_078_n03425413,gas pump,hallucinated,yes,yes,no,11.207026373126265,1,1,11.207026373126265
+imagenette_020_n03394916,French horn,hallucinated,yes,yes,no,11.572625526331565,1,1,11.572625526331565
+imagenette_022_n02102040,English springer,factual,yes,yes,no,-11.573503879157885,0,1,11.573503879157885
+imagenette_057_n03888257,parachute,hallucinated,yes,yes,no,11.851180743454494,1,1,11.851180743454494
+imagenette_012_n03888257,parachute,hallucinated,yes,yes,no,12.032687352031857,1,1,12.032687352031857
+imagenette_046_n03394916,French horn,hallucinated,yes,yes,no,12.315285419739515,1,1,12.315285419739515
+imagenette_078_n03425413,gas pump,factual,yes,yes,no,-12.411662000929782,0,1,12.411662000929782
+imagenette_058_n03425413,gas pump,hallucinated,yes,yes,no,12.947423886236916,1,1,12.947423886236916
+imagenette_003_n03000684,chain saw,factual,yes,yes,no,-13.446631168071454,0,1,13.446631168071454
